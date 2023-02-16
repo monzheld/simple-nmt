@@ -6,6 +6,9 @@ from simple_nmt.search import SingleBeamSearchBoard
 
 
 class Attention(nn.Module):
+    """ 
+    Attention
+    """
 
     def __init__(self):
         super().__init__()
@@ -14,23 +17,45 @@ class Attention(nn.Module):
 
     def forward(self, Q, K, V, mask=None, dk=64):
         # |Q| = (batch_size, m, hidden_size)
+            # -> 실제로 들어오는 사이즈: (n_splits * batch_size, m, hidden_size / n_splits)
         # |K| = |V| = (batch_size, n, hidden_size)
+            # -> 실제로 들어오는 사이즈: (n_splits * batch_size, n, hidden_size / n_splits)
         # |mask| = (batch_size, m, n)
+            # -> 실제로 들어오는 사이즈: (n_splits * batch_size, m, n)
 
+        # weight 구하기
+            # K에 transpose 
+                # 원래 |K| = (batch_size, n, hidden_size)
+                # K에 transpose(KT) = (batch_size, hidden_size, n)
         w = torch.bmm(Q, K.transpose(1, 2))
-        # |w| = (batch_size, m, n)
+        # |Q| = (batch_size, m, hidden_size) * KT = (batch_size, hidden_size, n)
+        # => |w| = (batch_size, m, n)
+            # -> normalize되지 않은 weight 값
+
+        # mask 구하기
+        # -무한대를 넣어준 후, softmax 취하기 => 0이 들어감
         if mask is not None:
             assert w.size() == mask.size()
             w.masked_fill_(mask, -float('inf'))
 
+        # gradient를 안정적으로 만들기 위해 (dk**.5)로 나눠줌
         w = self.softmax(w / (dk**.5))
+            # -> 확률분포처럼 다 더했을 때 1이 되는 normalize된 weight 값이 나옴
+            # size는 그대로 |w| = (batch_size, m, n)
+        
+        # normalize된 w에 V를 Batch matrix multiplication
         c = torch.bmm(w, V)
-        # |c| = (batch_size, m, hidden_size)
+        # |w| = (batch_size, m, n) * |V| = (batch_size, n, hidden_size)
+        # => |c| = (batch_size, m, hidden_size)
+            # -> 실제로 return 될 사이즈: (n_splits * batch_size, m, hidden_size / n_splits)
 
         return c
 
 
 class MultiHead(nn.Module):
+    """ 
+    Multi-head Attention
+    """
 
     def __init__(self, hidden_size, n_splits):
         super().__init__()
@@ -39,25 +64,36 @@ class MultiHead(nn.Module):
         self.n_splits = n_splits
 
         # Note that we don't have to declare each linear layer, separately.
+        # Q, K, V에 대해 각각 linear transformation한 것
+            # head 하나의 dimension = hidden_size / n_splits
+                # (hidden_size / n_splits) * n_splits => hidden_size * hidden_size
         self.Q_linear = nn.Linear(hidden_size, hidden_size, bias=False)
         self.K_linear = nn.Linear(hidden_size, hidden_size, bias=False)
         self.V_linear = nn.Linear(hidden_size, hidden_size, bias=False)
+        # 마지막으로 통과할 linear layer 하나
         self.linear = nn.Linear(hidden_size, hidden_size, bias=False)
 
+        # Attention 선언
         self.attn = Attention()
 
     def forward(self, Q, K, V, mask=None):
-        # |Q|    = (batch_size, m, hidden_size)
-        # |K|    = (batch_size, n, hidden_size)
+        # |Q|    = (batch_size, m, hidden_size) -> m = 디코더의 time-stamp 개수
+        # |K|    = (batch_size, n, hidden_size) -> n = 인코더의 time-stamp 개수
         # |V|    = |K|
+            # -> 인코더의 최종 output: |K|, |V|
+            # 디코더의 현재 layer의 이전 layer의 output: |Q|
         # |mask| = (batch_size, m, n)
 
+        # 맨 마지막 dimension(dim=-1)에 대해 split()
+        # -> QWs, KWs, VWs는 리스트가 됨
         QWs = self.Q_linear(Q).split(self.hidden_size // self.n_splits, dim=-1)
         KWs = self.K_linear(K).split(self.hidden_size // self.n_splits, dim=-1)
         VWs = self.V_linear(V).split(self.hidden_size // self.n_splits, dim=-1)
         # |QW_i| = (batch_size, m, hidden_size / n_splits)
         # |KW_i| = |VW_i| = (batch_size, n, hidden_size / n_splits)
+        # -> 그 리스트 안에 들어있는 각 원소
 
+        # parallel 하게 연산하기 위해 QWs, KWs, VWs 재정의
         # By concatenating splited linear transformed results,
         # we can remove sequential operations,
         # like mini-batch parallel operations.
@@ -67,6 +103,8 @@ class MultiHead(nn.Module):
         # |QWs| = (batch_size * n_splits, m, hidden_size / n_splits)
         # |KWs| = |VWs| = (batch_size * n_splits, n, hidden_size / n_splits)
 
+        # mask가 들어오는 경우, mask도 확장해 줌
+            # 원래 mask 사이즈 => |mask| = (batch_size, m, n)
         if mask is not None:
             mask = torch.cat([mask for _ in range(self.n_splits)], dim=0)
             # |mask| = (batch_size * n_splits, m, n)
@@ -79,8 +117,11 @@ class MultiHead(nn.Module):
         # |c| = (batch_size * n_splits, m, hidden_size / n_splits)
 
         # We need to restore temporal mini-batchfied multi-head attention results.
+        # batch_size로 쪼개기
         c = c.split(Q.size(0), dim=0)
         # |c_i| = (batch_size, m, hidden_size / n_splits)
+
+        # 먼저, cat을 마지막 dimension(dim=-1)에 붙이고 linear layer 통과
         c = self.linear(torch.cat(c, dim=-1))
         # |c| = (batch_size, m, hidden_size)
 

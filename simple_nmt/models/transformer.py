@@ -54,7 +54,7 @@ class Attention(nn.Module):
 
 class MultiHead(nn.Module):
     """ 
-    Multi-head Attention
+    Multi-Head Attention
     """
 
     def __init__(self, hidden_size, n_splits):
@@ -129,6 +129,9 @@ class MultiHead(nn.Module):
 
 
 class EncoderBlock(nn.Module):
+    """ 
+    Encoder Block
+    """
 
     def __init__(
         self,
@@ -139,35 +142,56 @@ class EncoderBlock(nn.Module):
     ):
         super().__init__()
 
+        # Multi-Head Attention
         self.attn = MultiHead(hidden_size, n_splits)
+        # Attention을 위한 Layer Normalization
         self.attn_norm = nn.LayerNorm(hidden_size)
+        # Dropout
         self.attn_dropout = nn.Dropout(dropout_p)
 
+        # Feed Forward(FFN)
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.LeakyReLU() if use_leaky_relu else nn.ReLU(),
-            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Linear(hidden_size, hidden_size * 4), # hidden_size로 들어온 것을 hidden_size의 4배로 늘림
+            nn.LeakyReLU() if use_leaky_relu else nn.ReLU(), # LeakyReLU 또는 ReLU에 통과
+            nn.Linear(hidden_size * 4, hidden_size), # hidden_size의 4배에서 다시 hidden_size로 돌아감
         )
+        # Feed Forward 다음에 있는 Layer Normalization
         self.fc_norm = nn.LayerNorm(hidden_size)
+        # Dropout
         self.fc_dropout = nn.Dropout(dropout_p)
 
     def forward(self, x, mask):
         # |x|    = (batch_size, n, hidden_size)
         # |mask| = (batch_size, n, n)
 
-        # Post-LN:
+        # (논문에 나와있는 방식)
+        # Post-LN(Post Layer Normalization):
+
+        # 순서: Muti-Head Attention(self.attn) -> dropout(self.attn_dropout) -> residual connection(이전 입력인 x 더하기) -> Layer Normalization(self.attn_norm) 
+            # Q, K, V에는 각각 x가 들어감(self-attention이기 때문)
         # z = self.attn_norm(x + self.attn_dropout(self.attn(Q=x,
         #                                                    K=x,
         #                                                    V=x,
         #                                                    mask=mask)))
+
+        # 순서: FFN(self.fc) -> dropout(self.fc_dropout) -> residual connection(이전 입력인 z 더하기) -> Layer Normalization(self.fc_norm)
         # z = self.fc_norm(z + self.fc_dropout(self.fc(z)))
 
-        # Pre-LN:
+
+        # (모델에 적용한 방식)
+        # Pre-LN(Pre Layer Normalization):
+
+        # 먼저, Layer Normalization(self.attn_norm)
         z = self.attn_norm(x)
+
+        # 순서: Muti-Head Attention(self.attn) -> dropout(self.attn_dropout) -> residual connection(이전 입력인 x 더하기)
+            # Q, K, V에는 각각 z가 들어감(self-attention이기 때문)
         z = x + self.attn_dropout(self.attn(Q=z,
                                             K=z,
                                             V=z,
                                             mask=mask))
+
+        # 순서: Layer Normalization(self.fc_norm) -> FFN(self.fc) -> dropout(self.fc_dropout) -> residual connection(이전 입력인 z 더하기)
         z = z + self.fc_dropout(self.fc(self.fc_norm(z)))
         # |z| = (batch_size, n, hidden_size)
 

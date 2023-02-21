@@ -77,8 +77,8 @@ class MultiHead(nn.Module):
         self.attn = Attention()
 
     def forward(self, Q, K, V, mask=None):
-        # |Q|    = (batch_size, m, hidden_size) -> m = 디코더의 time-stamp 개수
-        # |K|    = (batch_size, n, hidden_size) -> n = 인코더의 time-stamp 개수
+        # |Q|    = (batch_size, m, hidden_size) -> m = 디코더의 time-step 개수
+        # |K|    = (batch_size, n, hidden_size) -> n = 인코더의 time-step 개수
         # |V|    = |K|
             # -> 인코더의 최종 output: |K|, |V|
             # 디코더의 현재 layer의 이전 layer의 output: |Q|
@@ -131,6 +131,10 @@ class MultiHead(nn.Module):
 class EncoderBlock(nn.Module):
     """ 
     Encoder Block
+
+    - 2개의 Layer Normalization
+        1) Attention을 위한 Layer Normalization
+        2) Feed Forward 다음에 있는 Layer Normalization
     """
 
     def __init__(
@@ -144,7 +148,7 @@ class EncoderBlock(nn.Module):
 
         # Multi-Head Attention
         self.attn = MultiHead(hidden_size, n_splits)
-        # Attention을 위한 Layer Normalization
+        # 1) Attention을 위한 Layer Normalization
         self.attn_norm = nn.LayerNorm(hidden_size)
         # Dropout
         self.attn_dropout = nn.Dropout(dropout_p)
@@ -155,7 +159,7 @@ class EncoderBlock(nn.Module):
             nn.LeakyReLU() if use_leaky_relu else nn.ReLU(), # LeakyReLU 또는 ReLU에 통과
             nn.Linear(hidden_size * 4, hidden_size), # hidden_size의 4배에서 다시 hidden_size로 돌아감
         )
-        # Feed Forward 다음에 있는 Layer Normalization
+        # 2) Feed Forward 다음에 있는 Layer Normalization
         self.fc_norm = nn.LayerNorm(hidden_size)
         # Dropout
         self.fc_dropout = nn.Dropout(dropout_p)
@@ -196,9 +200,17 @@ class EncoderBlock(nn.Module):
         # |z| = (batch_size, n, hidden_size)
 
         return z, mask
+        # -> 입력과 출력 인터페이스가 같음
 
 
 class DecoderBlock(nn.Module):
+    """ 
+    Decoder Block
+
+    - 2개의 Attention
+        1) Decoder 자기 자신에 대한 self-attention
+        2) Encoder에 대한 attention
+    """
 
     def __init__(
         self,
@@ -209,33 +221,47 @@ class DecoderBlock(nn.Module):
     ):
         super().__init__()
 
+        # 1) Decoder 자기 자신에 대한 self-attention
         self.masked_attn = MultiHead(hidden_size, n_splits)
-        self.masked_attn_norm = nn.LayerNorm(hidden_size)
-        self.masked_attn_dropout = nn.Dropout(dropout_p)
+        # masked_attn에 대한 Layer Normalization
+        self.masked_attn_norm = nn.LayerNorm(hidden_size) 
+        # masked_attn에 대한 Dropout
+        self.masked_attn_dropout = nn.Dropout(dropout_p) 
 
+        # 2) Encoder에 대한 attention
         self.attn = MultiHead(hidden_size, n_splits)
+        # attn에 대한 Layer Normalization
         self.attn_norm = nn.LayerNorm(hidden_size)
+        # attn에 대한 Dropout
         self.attn_dropout = nn.Dropout(dropout_p)
 
+        # Feed Forward(FFN)
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.LeakyReLU() if use_leaky_relu else nn.ReLU(),
-            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Linear(hidden_size, hidden_size * 4), # hidden_size로 들어온 것을 hidden_size의 4배로 늘림
+            nn.LeakyReLU() if use_leaky_relu else nn.ReLU(), # LeakyReLU 또는 ReLU에 통과
+            nn.Linear(hidden_size * 4, hidden_size), # hidden_size의 4배에서 다시 hidden_size로 돌아감
         )
+        # Feed Forward 다음에 있는 Layer Normalization
         self.fc_norm = nn.LayerNorm(hidden_size)
+        # Dropout
         self.fc_dropout = nn.Dropout(dropout_p)
 
     def forward(self, x, key_and_value, mask, prev, future_mask):
-        # |key_and_value| = (batch_size, n, hidden_size)
-        # |mask|          = (batch_size, m, n)
+        # |key_and_value| = (batch_size, n, hidden_size) # -> Encoder의 output
+        # |mask|          = (batch_size, m, n) # -> Encoder에서 비어있는 time-step(pad가 들어있는 곳)을 마스킹 해놓은 mask
 
         # In case of inference, we don't have to repeat same feed-forward operations.
         # Thus, we save previous feed-forward results.
+
+        # prev: 각 layer 별로 이전 time-step까지의 모든 출력값
+        # -> prev가 주어지면 추론, 아니면 학습 모드 
+
+        # 학습 시에는 모든 time-step가 한 번에 들어감
         if prev is None: # Training mode
-            # |x|           = (batch_size, m, hidden_size)
+            # |x|           = (batch_size, m, hidden_size) # -> 전체 time-step에 다 들어옴
             # |prev|        = None
-            # |future_mask| = (batch_size, m, m)
-            # |z|           = (batch_size, m, hidden_size)
+            # |future_mask| = (batch_size, m, m) # -> self-attention 시 미래의 time-step을 보지 못하게 하는 mask
+            # |z|           = (batch_size, m, hidden_size) # -> 아래에서 실행한 결과값
 
             # Post-LN:
             # z = self.masked_attn_norm(x + self.masked_attn_dropout(
@@ -243,41 +269,53 @@ class DecoderBlock(nn.Module):
             # ))
 
             # Pre-LN:
+            # 먼저, Layer Normalization 
             z = self.masked_attn_norm(x)
             z = x + self.masked_attn_dropout(
                 self.masked_attn(z, z, z, mask=future_mask)
             )
+            # => Encoder와 같은 방식 
+        
+        # 추론 시에는 하나의 time-step씩 들어감
         else: # Inference mode
-            # |x|           = (batch_size, 1, hidden_size)
-            # |prev|        = (batch_size, t - 1, hidden_size)
-            # |future_mask| = None
-            # |z|           = (batch_size, 1, hidden_size)
+            # |x|           = (batch_size, 1, hidden_size) # -> 하나의 time-step만 들어옴
+            # |prev|        = (batch_size, t - 1, hidden_size) # -> 각 layer 별로 이전 time-step까지의 모든 출력값
+            # |future_mask| = None # -> 미래의 time-step이 없기 때문에 mask 필요 없음 
+            # |z|           = (batch_size, 1, hidden_size) # -> 아래에서 실행한 결과값
 
+            # prev에 대해 Attention 수행
             # Post-LN:
             # z = self.masked_attn_norm(x + self.masked_attn_dropout(
             #     self.masked_attn(x, prev, prev, mask=None)
             # ))
+                               # -> Q = x, K = prev, V = prev
 
             # Pre-LN:
+            # 먼저, Layer Normalization 
             normed_prev = self.masked_attn_norm(prev)
             z = self.masked_attn_norm(x)
             z = x + self.masked_attn_dropout(
-                self.masked_attn(z, normed_prev, normed_prev, mask=None)
+                self.masked_attn(z, normed_prev, normed_prev, mask=None) # mask 생략 (추론 모드에서는 미래의 time-step이 없기 때문)
             )
+                            # -> Q = z, K = normed_prev, V = normed_prev
 
         # Post-LN:
-        # z = self.attn_norm(z + self.attn_dropout(self.attn(Q=z,
-        #                                                    K=key_and_value,
-        #                                                    V=key_and_value,
-        #                                                    mask=mask)))
+        # z = self.attn_norm(z + self.attn_dropout(self.attn(Q=z, # -> 위에서 나온 z
+        #                                                    K=key_and_value, # -> Encoder의 output
+        #                                                    V=key_and_value, # -> Encoder의 output
+        #                                                    mask=mask))) # -> Encoder에서 비어있는 time-step(pad가 들어있는 곳)을 마스킹 해놓은 mask
 
         # Pre-LN:
+        # 먼저, Layer Normalization 
         normed_key_and_value = self.attn_norm(key_and_value)
-        z = z + self.attn_dropout(self.attn(Q=self.attn_norm(z),
-                                            K=normed_key_and_value,
-                                            V=normed_key_and_value,
-                                            mask=mask))
+        z = z + self.attn_dropout(self.attn(Q=self.attn_norm(z), # -> 위에서 나온 z
+                                            K=normed_key_and_value, 
+                                            V=normed_key_and_value, 
+                                            mask=mask)) # -> Encoder에서 비어있는 time-step(pad가 들어있는 곳)을 마스킹 해놓은 mask
         # |z| = (batch_size, m, hidden_size)
+
+
+        # Feed Forward(FFN) layer 통과
 
         # Post-LN:
         # z = self.fc_norm(z + self.fc_dropout(self.fc(z)))
@@ -287,6 +325,8 @@ class DecoderBlock(nn.Module):
         # |z| = (batch_size, m, hidden_size)
 
         return z, key_and_value, mask, prev, future_mask
+        # 이 출력값들을 Sequential에 넣을 것이기 때문에 다음 layer에서 이 값들을 그대로 입력받음
+        # -> 입력과 출력 인터페이스가 같음
 
 
 class MySequential(nn.Sequential):

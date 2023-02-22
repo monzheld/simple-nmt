@@ -330,6 +330,12 @@ class DecoderBlock(nn.Module):
 
 
 class MySequential(nn.Sequential):
+    """ 
+    Sequential
+
+    - nn.Sequential의 경우, 하나의 tensor만 입력으로 받는다는 문제 존재
+    - for문을 통해 tuple 같이 여러 개의 입력이 주어졌을 때도 입력과 출력 interface가 같도록 만들어줌
+    """
 
     def forward(self, *x):
         # nn.Sequential class does not provide multiple input arguments and returns.
@@ -367,19 +373,25 @@ class Transformer(nn.Module):
 
         super().__init__()
 
-        self.emb_enc = nn.Embedding(input_size, hidden_size)
-        self.emb_dec = nn.Embedding(output_size, hidden_size)
+        # Encoder Embedding
+        self.emb_enc = nn.Embedding(input_size, hidden_size) # -> source language의 vocab size를 입력으로 받아서 hidden_size로 뱉어줌
+        # Decoder Embedding
+        self.emb_dec = nn.Embedding(output_size, hidden_size) # -> target language의 vocab size를 입력으로 받아서 hidden_size로 뱉어줌 
+        # Dropout
         self.emb_dropout = nn.Dropout(dropout_p)
 
+        # Positional Encoding
+        # -> positional encoding을 하는 matrix를 미리 max_length 만큼 하나 만들어놓고 필요할 때마다 필요한 만큼만 잘라서 사용
         self.pos_enc = self._generate_pos_enc(hidden_size, max_length)
 
+        # Encoder, Decoder -> MySequential 사용
         self.encoder = MySequential(
             *[EncoderBlock(
                 hidden_size,
                 n_splits,
                 dropout_p,
                 use_leaky_relu,
-              ) for _ in range(n_enc_blocks)],
+              ) for _ in range(n_enc_blocks)], # for문으로 필요한 encoder blocks의 개수만큼을 선언
         )
         self.decoder = MySequential(
             *[DecoderBlock(
@@ -387,15 +399,18 @@ class Transformer(nn.Module):
                 n_splits,
                 dropout_p,
                 use_leaky_relu,
-              ) for _ in range(n_dec_blocks)],
+              ) for _ in range(n_dec_blocks)], # for문으로 필요한 decoder blocks의 개수만큼을 선언
         )
+        # generator -> nn.Sequential 사용 
         self.generator = nn.Sequential(
-            nn.LayerNorm(hidden_size), # Only for Pre-LN Transformer.
+            nn.LayerNorm(hidden_size), # Only for Pre-LN Transformer. (Post-LN인 경우, 이 부분 필요 x)
             nn.Linear(hidden_size, output_size),
-            nn.LogSoftmax(dim=-1),
+            nn.LogSoftmax(dim=-1), # 각 time-step 별, 단어 별 로그 확률 값을 return 
         )
 
     @torch.no_grad()
+    # positional encoding을 하는 전체 matrix를 생성하는 함수
+    # -> max_length 만큼의 matrix를 만들고, 그 안에 값들을 모두 채움
     def _generate_pos_enc(self, hidden_size, max_length):
         enc = torch.FloatTensor(max_length, hidden_size).zero_()
         # |enc| = (max_length, hidden_size)
@@ -405,24 +420,34 @@ class Transformer(nn.Module):
         # |pos| = (max_length, 1)
         # |dim| = (1, hidden_size // 2)
 
+        # 짝수 dimension -> sin()
         enc[:, 0::2] = torch.sin(pos / 1e+4**dim.div(float(hidden_size)))
+        # 홀수 dimension -> cos()
         enc[:, 1::2] = torch.cos(pos / 1e+4**dim.div(float(hidden_size)))
 
         return enc
 
+    # matrix에서 필요한 만큼 자르는 함수 
     def _position_encoding(self, x, init_pos=0):
+        # init_pos(= initial position): 추론 시 Decoder의 positional encoding은 time-step이 하나씩 들어가기 때문에 항상 같은 position이 들어가는 것을 막기 위해 필요
+            # (학습 시에는 항상 전체 time-step이 다 들어가기 때문에 상관 없음)
         # |x| = (batch_size, n, hidden_size)
         # |self.pos_enc| = (max_length, hidden_size)
         assert x.size(-1) == self.pos_enc.size(-1)
         assert x.size(1) + init_pos <= self.max_length
 
         pos_enc = self.pos_enc[init_pos:init_pos + x.size(1)].unsqueeze(0)
+            # [init_pos:init_pos + x.size(1)] -> 0부터 n까지 
+            # => self.pos_enc을 0부터 (0 + n)까지 자름
         # |pos_enc| = (1, n, hidden_size)
         x = x + pos_enc.to(x.device)
+            # -> |pos_enc| = (1, n, hidden_size)에서의 1이 broadcasting돼서 batch_size로 자동으로 늘어남
+            # => x의 원래 size인 (batch_size, n, hidden_size)에 맞게 잘라짐
 
         return x
 
     @torch.no_grad()
+    # mask를 생성하는 함수
     def _generate_mask(self, x, length):
         mask = []
 
@@ -431,13 +456,13 @@ class Transformer(nn.Module):
             if max_length - l > 0:
                 # If the length is shorter than maximum length among samples,
                 # set last few values to be 1s to remove attention weight.
-                mask += [torch.cat([x.new_ones(1, l).zero_(),
-                                    x.new_ones(1, (max_length - l))
+                mask += [torch.cat([x.new_ones(1, l).zero_(), # 0이 l 개만큼
+                                    x.new_ones(1, (max_length - l)) # 1이 (max_length - l) 개만큼
                                     ], dim=-1)]
             else:
                 # If length of sample equals to maximum length among samples,
                 # set every value in mask to be 0.
-                mask += [x.new_ones(1, l).zero_()]
+                mask += [x.new_ones(1, l).zero_()] # 0이 l 개만큼
 
         mask = torch.cat(mask, dim=0).bool()
         # |mask| = (batch_size, max_length)
@@ -448,33 +473,61 @@ class Transformer(nn.Module):
         # |x[0]| = (batch_size, n)
         # |y|    = (batch_size, m)
 
+        # Mask Generation
         # Mask to prevent having attention weight on padding position.
-        with torch.no_grad():
-            mask = self._generate_mask(x[0], x[1])
+        with torch.no_grad(): # 학습 시 gradient를 받을 필요가 없으므로 no_grad()를 준 상태에서 mask generation 
+            mask = self._generate_mask(x[0], x[1]) # x[0] : 원핫 인코딩 벡터(tensor), x[1] : mini-batch의 각 sample 별 length(=time-step)
             # |mask| = (batch_size, n)
             x = x[0]
 
             mask_enc = mask.unsqueeze(1).expand(*x.size(), mask.size(-1))
+                # mask.unsqueeze(1) -> (batch_size, 1, n)
+                # *x.size(): (batch_size, n)
+                # mask.size(-1): n (|mask| = (batch_size, n)의 제일 마지막 원소인 n)
             mask_dec = mask.unsqueeze(1).expand(*y.size(), mask.size(-1))
-            # |mask_enc| = (batch_size, n, n)
-            # |mask_dec| = (batch_size, m, n)
+            # |mask_enc| = (batch_size, n, n) # -> Encoder에서의 mask
+                # => Encoder에서 self-attention할 때, 빈 time-step에 masking된 것
+            # |mask_dec| = (batch_size, m, n) # -> Decoder에서의 mask
+                # => Decoder에서 Encoder에 attention할 때, Encoder의 빈 time-step에 masking된 것
 
-        z = self.emb_dropout(self._position_encoding(self.emb_enc(x)))
+        # 순서: x를 Encoder Embedding layer에 통과 -> positional encoding(여기에서는 init_pos 없음) -> Dropout
+        z = self.emb_dropout(self._position_encoding(self.emb_enc(x))) # -> word embedding vector(tensor)가 나옴
+        # z를 encoder에 통과
         z, _ = self.encoder(z, mask_enc)
+            # -> z만 필요
         # |z| = (batch_size, n, hidden_size)
+            # => z는 Encoder의 최종 layer의 output
+            # (Decoder에서 이 z에 대해 attention 수행)
 
         # Generate future mask
+        # future mask: 미래의 time-step을 보지 못하게 하는 mask
+        # -> 따로 함수로 구현하지 않고 매번 구함
         with torch.no_grad():
             future_mask = torch.triu(x.new_ones((y.size(1), y.size(1))), diagonal=1).bool()
+                # triu: upper triangle
+                # y.size(1): m
+                # => 1로 가득 찬 m x m 사이즈의 triu matrix
+                # 주의) diagonal에 0이 아닌 1을 줌
             # |future_mask| = (m, m)
-            future_mask = future_mask.unsqueeze(0).expand(y.size(0), *future_mask.size())
-            # |fwd_mask| = (batch_size, m, m)
 
-        h = self.emb_dropout(self._position_encoding(self.emb_dec(y)))
-        h, _, _, _, _ = self.decoder(h, z, mask_dec, None, future_mask)
+            # future_mask를 batch_size 만큼 똑같이 복사
+            future_mask = future_mask.unsqueeze(0).expand(y.size(0), *future_mask.size())
+                # future_mask.unsqueeze(0) -> (1, m, m)
+                # y.size(0): batch_size
+                # *future_mask.size(): (m, m)
+            # |future_mask| = (batch_size, m, m)
+
+        # 순서: y를 Decoder Embedding layer에 통과 -> positional encoding -> Dropout
+        h = self.emb_dropout(self._position_encoding(self.emb_dec(y))) # -> word embedding vector(tensor)가 나옴
+        # h를 decoder에 통과
+        h, _, _, _, _ = self.decoder(h, z, mask_dec, None, future_mask) 
+            # -> prev = None
+            # z: Encoder의 최종 layer의 output
+            # -> h만 필요
         # |h| = (batch_size, m, hidden_size)
 
-        y_hat = self.generator(h)
+        # h를 generator에 넣어줌
+        y_hat = self.generator(h) # -> 로그 확률 값으로 나옴
         # |y_hat| = (batch_size, m, output_size)
 
         return y_hat

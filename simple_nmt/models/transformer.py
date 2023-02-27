@@ -409,9 +409,11 @@ class Transformer(nn.Module):
         )
 
     @torch.no_grad()
-    # positional encoding을 하는 전체 matrix를 생성하는 함수
-    # -> max_length 만큼의 matrix를 만들고, 그 안에 값들을 모두 채움
     def _generate_pos_enc(self, hidden_size, max_length):
+        """ 
+        positional encoding을 하는 전체 matrix를 생성하는 함수
+            -> max_length 만큼의 matrix를 만들고, 그 안에 값들을 모두 채움
+        """
         enc = torch.FloatTensor(max_length, hidden_size).zero_()
         # |enc| = (max_length, hidden_size)
 
@@ -427,8 +429,10 @@ class Transformer(nn.Module):
 
         return enc
 
-    # matrix에서 필요한 만큼 자르는 함수 
     def _position_encoding(self, x, init_pos=0):
+        """ 
+        matrix에서 필요한 만큼 자르는 함수 
+        """
         # init_pos(= initial position): 추론 시 Decoder의 positional encoding은 time-step이 하나씩 들어가기 때문에 항상 같은 position이 들어가는 것을 막기 위해 필요
             # (학습 시에는 항상 전체 time-step이 다 들어가기 때문에 상관 없음)
         # |x| = (batch_size, n, hidden_size)
@@ -447,8 +451,10 @@ class Transformer(nn.Module):
         return x
 
     @torch.no_grad()
-    # mask를 생성하는 함수
     def _generate_mask(self, x, length):
+        """ 
+        mask를 생성하는 함수
+        """
         mask = []
 
         max_length = max(length)
@@ -470,6 +476,9 @@ class Transformer(nn.Module):
         return mask
 
     def forward(self, x, y):
+        """ 
+        (학습)
+        """
         # |x[0]| = (batch_size, n)
         # |y|    = (batch_size, m)
 
@@ -533,78 +542,134 @@ class Transformer(nn.Module):
         return y_hat
 
     def search(self, x, is_greedy=True, max_length=255):
+        """ 
+        Greedy Search (추론)
+        """
+            
         # |x[0]| = (batch_size, n)
         batch_size = x[0].size(0)
 
-        mask = self._generate_mask(x[0], x[1])
+        # mask 생성
+        mask = self._generate_mask(x[0], x[1]) # -> Encoder의 time-step에 있는 mask
         # |mask| = (batch_size, n)
         x = x[0]
 
+        # mask를 Encoder에 적용하기 위해 늘림
         mask_enc = mask.unsqueeze(1).expand(mask.size(0), x.size(1), mask.size(-1))
+            # -> Encoder의 빈 time-step에 masking한 것
+        # Decoder에 대한 mask는 unsqueeze(1)만 진행
+            # -> 하나의 time-step씩 가기 때문 (학습: 모든 time-step의 개수인 m / 추론: 하나의 time-stpe인 1)
         mask_dec = mask.unsqueeze(1)
         # |mask_enc| = (batch_size, n, n)
         # |mask_dec| = (batch_size, 1, n)
 
+        # positional encoding
         z = self.emb_dropout(self._position_encoding(self.emb_enc(x)))
+        # Encoder 통과 
         z, _ = self.encoder(z, mask_enc)
         # |z| = (batch_size, n, hidden_size)
+            # -> Encoder의 output 
+            # => mini-batch 내 각 sample 별 Encoder의 time-step 별 hidden state 벡터
 
         # Fill a vector, which has 'batch_size' dimension, with BOS value.
+        # 추론 단계에서는 y의 값이 주어지지 않기 때문에 y의 seed 값을 생성
         y_t_1 = x.new(batch_size, 1).zero_() + data_loader.BOS
+            # -> batch_size의 개수만큼 하나의 time-step에 대한 원핫벡터 생성
+            # y_t_1 => y의 0번째 time-step의 원핫벡터
         # |y_t_1| = (batch_size, 1)
+
+        # 각 sample 별로 해당 sample이 decoding 중인지에 대한 flag
+        # (1: decoding 중 / 0: decoding 끝남)
         is_decoding = x.new_ones(batch_size, 1).bool()
 
+        # 이전 time-step의 결과물들을 전부 저장
         prevs = [None for _ in range(len(self.decoder._modules) + 1)]
+            # range(len(self.decoder._modules) + 1) -> 모든 layer + 1(입력단)
+            # -> 일단 None으로 채운 리스트 
+        
+        # decoding이 완료된 time-step에 대한 결과물들을 담는 리스트
         y_hats, indice = [], []
+
         # Repeat a loop while sum of 'is_decoding' flag is bigger than 0,
+            # -> mini-batch 내에서 아직 decoding되는 중인 경우 
         # or current time-step is smaller than maximum length.
         while is_decoding.sum() > 0 and len(indice) < max_length:
             # Unlike training procedure,
             # take the last time-step's output during the inference.
+            # positional encoding -> dropout
             h_t = self.emb_dropout(
                 self._position_encoding(self.emb_dec(y_t_1), init_pos=len(indice))
             )
-            # |h_t| = (batch_size, 1, hidden_size))
+                # => 첫 번째 layer에 대한 입력
+            # |h_t| = (batch_size, 1, hidden_size) # -> mini-batch내 각 sample 별 하나의 time-step에 대한 hidden state 벡터(hidden representation)
+
+            # prevs[0]: 입력단
             if prevs[0] is None:
                 prevs[0] = h_t
+            # prevs[0]이 비어있지 않은 경우 -> 첫 번째 time-step 이후의 time-step
             else:
+                # 기존의 입력들에 대해 concat 
                 prevs[0] = torch.cat([prevs[0], h_t], dim=1)
+                    # dim=1: time-step dimension에 대해 (<- |h_t| = (batch_size, 1, hidden_size)에서의 1)
+                    # -> time-step의 dimension에 대해 concat
+                    # => 모든 이전 hidden_state들을 하나의 tensor로 생성  
 
+            # layer 개수만큼 반복
             for layer_index, block in enumerate(self.decoder._modules.values()):
                 prev = prevs[layer_index]
                 # |prev| = (batch_size, len(y_hats), hidden_size)
+                    # y_hats: 현재 time-step이 얼마나 흘렀는지
 
+                # Decoder block에 넣음
                 h_t, _, _, _, _ = block(h_t, z, mask_dec, prev, None)
+                    # -> prev가 None이면 학습 / None이 아니면 추론 mode
+                    # None -> future_mask = None (추론 시에는 미래를 볼 필요가 없기 때문)
+                    # z: Encoder의 output
+                    # mask_dec: Decoder에서 Encoder에 attention할 때, Encoder의 빈 time-step에 masking된 것
+                    # h_t: 이전 layer로부터 온 결과값
                 # |h_t| = (batch_size, 1, hidden_size)
 
                 if prevs[layer_index + 1] is None:
                     prevs[layer_index + 1] = h_t
                 else:
+                    # 원래 있던 prevs에 위에서 나온 값을 concat 
                     prevs[layer_index + 1] = torch.cat([prevs[layer_index + 1], h_t], dim=1)
                 # |prev| = (batch_size, len(y_hats) + 1, hidden_size)
 
+            # 마지막으로 나온 값(h_t)를 generator에 통과
             y_hat_t = self.generator(h_t)
-            # |y_hat_t| = (batch_size, 1, output_size)
+            # => 해당 time-step의 각 단어별 확률 분포
+            # |y_hat_t| = (batch_size, 1, output_size) # -> mini-batch 내 각 sample 별 현재 time-step에 대한 확률 분포(각 단어별 로그 확률 값) 
 
+            # y_hat_t들을 y_hats로 저장 
             y_hats += [y_hat_t]
+
+            # is_greedy인 경우, top k를 뽑음 (is_greedy=True -> 매 time-step마다 가장 높은 값을 가진 단어를 뽑음)
             if is_greedy: # Argmax
                 y_t_1 = torch.topk(y_hat_t, 1, dim=-1)[1].squeeze(-1)
+            # is_greedy가 아닌 경우, multinomial 연산 수행 (is_greedy=False -> 확률분포상에 있는 대로 랜덤하게 뽑음)
             else: # Random sampling                
                 y_t_1 = torch.multinomial(y_hat_t.exp().view(x.size(0), -1), 1)
+            # => 이렇게 나온 y_t_1은 다음 time-step에 사용됨 
+
             # Put PAD if the sample is done.
+            # decoding이 끝난 것들에 대해서는 PAD 씌우기
             y_t_1 = y_t_1.masked_fill_(
-                ~is_decoding,
+                ~is_decoding, # is_decoding=False인 경우 (=> decoding이 끝난 경우)
                 data_loader.PAD,
             )
 
             # Update is_decoding flag.
+            # is_decoding 업데이트 -> EOS가 있는 경우, is_decoding을 0으로 만들어줌
             is_decoding = is_decoding * torch.ne(y_t_1, data_loader.EOS)
             # |y_t_1| = (batch_size, 1)
             # |is_decoding| = (batch_size, 1)
             indice += [y_t_1]
 
         y_hats = torch.cat(y_hats, dim=1)
+            # dim=1 -> |y_hat_t| = (batch_size, 1, output_size)에서 1에 대해 concat 
         indice = torch.cat(indice, dim=-1)
+            # dim=-1 -> |y_t_1| = (batch_size, 1)에서 마지막 요소인 1에 대해 concat
         # |y_hats| = (batch_size, m, output_size)
         # |indice| = (batch_size, m)
 

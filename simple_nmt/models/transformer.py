@@ -684,6 +684,10 @@ class Transformer(nn.Module):
         n_best=1,
         length_penalty=.2,
     ):
+        """ 
+        Beam Search (추론)
+        """
+
         # |x[0]| = (batch_size, n)
         batch_size = x[0].size(0)
         n_dec_layers = len(self.decoder._modules)
@@ -701,6 +705,9 @@ class Transformer(nn.Module):
         z, _ = self.encoder(z, mask_enc)
         # |z| = (batch_size, n, hidden_size)
 
+        # -> 여기까지는 search() 함수와 동일
+
+        # 각 layer 별로 모든 time-step에 대해 다 가지고 있어야 함 
         prev_status_config = {}
         for layer_index in range(n_dec_layers + 1):
             prev_status_config['prev_state_%d' % layer_index] = {
@@ -709,7 +716,7 @@ class Transformer(nn.Module):
             }
         # Example of prev_status_config:
         # prev_status_config = {
-        #     'prev_state_0': {
+        #     'prev_state_0': {            # (<- 입력단의 prev_status)
         #         'init_status': None,
         #         'batch_dim_index': 0,
         #     },
@@ -720,28 +727,32 @@ class Transformer(nn.Module):
         #
         #     ...
         #
-        #     'prev_state_${n_layers}': {
+        #     'prev_state_${n_layers}': {  # (<- layer의 개수만큼)
         #         'init_status': None,
         #         'batch_dim_index': 0,
         #     }
         # }
 
+        # SingleBeamSearchBoard 초기화
         boards = [
             SingleBeamSearchBoard(
                 z.device,
                 prev_status_config,
                 beam_size=beam_size,
                 max_length=max_length,
-            ) for _ in range(batch_size)
+            ) for _ in range(batch_size) # batch_size 만큼 생성
         ]
         done_cnt = [board.is_done() for board in boards]
 
+        # 가짜 mini-batch를 생성하는 구간 
         length = 0
         while sum(done_cnt) < batch_size and length <= max_length:
+            # 초기화
             fab_input, fab_z, fab_mask = [], [], []
             fab_prevs = [[] for _ in range(n_dec_layers + 1)]
 
             for i, board in enumerate(boards): # i == sample_index in minibatch
+                # Beam Search decoding을 하는 중이라면 
                 if board.is_done() == 0:
                     y_hat_i, prev_status = board.get_batch()
 
@@ -749,8 +760,8 @@ class Transformer(nn.Module):
                     fab_z     += [z[i].unsqueeze(0)       ] * beam_size
                     fab_mask  += [mask_dec[i].unsqueeze(0)] * beam_size
 
-                    for layer_index in range(n_dec_layers + 1):
-                        prev_i = prev_status['prev_state_%d' % layer_index]
+                    for layer_index in range(n_dec_layers + 1): # Decoder의 layer 개수 + 1
+                        prev_i = prev_status['prev_state_%d' % layer_index] # layer_index:0 -> 입력단의 prev_status
                         if prev_i is not None:
                             fab_prevs[layer_index] += [prev_i]
                         else:
@@ -763,17 +774,18 @@ class Transformer(nn.Module):
                 if fab_prev is not None:
                     fab_prevs[i] = torch.cat(fab_prev, dim=0)
             # |fab_input|    = (current_batch_size, 1,)
-            # |fab_z|        = (current_batch_size, n, hidden_size)
-            # |fab_mask|     = (current_batch_size, 1, n)
-            # |fab_prevs[i]| = (current_batch_size, length, hidden_size)
-            # len(fab_prevs) = n_dec_layers + 1
+            # |fab_z|        = (current_batch_size, n, hidden_size) # -> Encoder의 output
+            # |fab_mask|     = (current_batch_size, 1, n) # -> Encoder에 들어가는 source sentence에 대한 mask
+            # |fab_prevs[i]| = (current_batch_size, length, hidden_size) # -> 각 layer 별로 생성
+            # len(fab_prevs) = n_dec_layers + 1 # <- 각 layer 별로 생성하기 때문에 길이는 Decoder의 layer 개수 + 1
 
             # Unlike training procedure,
             # take the last time-step's output during the inference.
             h_t = self.emb_dropout(
-                self._position_encoding(self.emb_dec(fab_input), init_pos=length)
+                self._position_encoding(self.emb_dec(fab_input), init_pos=length) # init position을 현재 time-step 만큼으로 초기화
             )
             # |h_t| = (current_batch_size, 1, hidden_size)
+                # => 첫 번째 layer의 입력
             if fab_prevs[0] is None:
                 fab_prevs[0] = h_t
             else:
@@ -795,12 +807,14 @@ class Transformer(nn.Module):
                     ) # Append new hidden state for each layer.
 
             y_hat_t = self.generator(h_t)
-            # |y_hat_t| = (batch_size, 1, output_size)
+            # |y_hat_t| = (batch_size, 1, output_size) # -> mini-batch 내 각 sample 별 현재 time-step에 대한 log 확률 분포
 
             # |fab_prevs[i][begin:end]| = (beam_size, length, hidden_size)
             cnt = 0
             for board in boards:
+                # 동작 중인 board에 대해서만 
                 if board.is_done() == 0:
+                    # 어느 index부터 어느 index까지가 어느 board에 속하는지를 알려 줄 index
                     begin = cnt * beam_size
                     end = begin + beam_size
 
@@ -813,10 +827,11 @@ class Transformer(nn.Module):
                     cnt += 1
 
             done_cnt = [board.is_done() for board in boards]
-            length += 1
+            length += 1 # 현재 몇 번째 time-step까지 decoding 되었는지 
 
         batch_sentences, batch_probs = [], []
 
+        # 결과 취합
         for i, board in enumerate(boards):
             sentences, probs = board.get_n_best(n_best, length_penalty=length_penalty)
 

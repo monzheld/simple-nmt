@@ -216,22 +216,25 @@ def define_argparser(is_continue=False):
 
 
 def get_model(input_size, output_size, config):
+    # use_transformer이면 Transformer 모델을 return 
     if config.use_transformer:
         model = Transformer(
             input_size,                     # Source vocabulary size
-            config.hidden_size,             # Transformer doesn't need word_vec_size.
+            config.hidden_size,             # Transformer doesn't need word_vec_size. 
             output_size,                    # Target vocabulary size
             n_splits=config.n_splits,       # Number of head in Multi-head Attention.
             n_enc_blocks=config.n_layers,   # Number of encoder blocks
             n_dec_blocks=config.n_layers,   # Number of decoder blocks
+                # -> 현재는 동일한 개수로 설정 
             dropout_p=config.dropout,       # Dropout rate on each block
         )
+    # use_transformer가 꺼져 있으면 Seq2Seq 모델을 return 
     else:
         model = Seq2Seq(
-            input_size,
+            input_size,                     # Source vocabulary size
             config.word_vec_size,           # Word embedding vector size
             config.hidden_size,             # LSTM's hidden vector size
-            output_size,
+            output_size,                    # Target vocabulary size
             n_layers=config.n_layers,       # number of layers in LSTM
             dropout_p=config.dropout        # dropout-rate in LSTM
         )
@@ -256,12 +259,18 @@ def get_crit(output_size, pad_index):
 
 def get_optimizer(model, config):
     if config.use_adam:
+        # use_adam이면서 use_transformer인 경우, Adam을 사용하는데 beats를 0.9와 0.98로 줌
         if config.use_transformer:
-            optimizer = optim.Adam(model.parameters(), lr=config.lr, betas=(.9, .98))
+            optimizer = optim.Adam(model.parameters(), lr=config.lr, betas=(.9, .98)) 
+                # betas=(.9, .98) : Pre-LM Transformer 논문에 나온 수치 
+                # lr: 보통 1e-3 사용
+        # 그냥 seq2seq인 경우, 기본 Adam 사용 
         else: # case of rnn based seq2seq.
             optimizer = optim.Adam(model.parameters(), lr=config.lr)
+    # radam(Rectified Adam)을 사용할 경우
     elif config.use_radam:
         optimizer = custom_optim.RAdam(model.parameters(), lr=config.lr)
+    # 아무것도 포함되지 않은 경우, SGD 사용 
     else:
         optimizer = optim.SGD(model.parameters(), lr=config.lr)
 
@@ -284,7 +293,7 @@ def get_scheduler(optimizer, config):
         lr_scheduler = None
 
     return lr_scheduler
-
+ 
 
 def main(config, model_weight=None, opt_weight=None):
     def print_config(config):
@@ -304,7 +313,7 @@ def main(config, model_weight=None, opt_weight=None):
 
     input_size, output_size = len(loader.src.vocab), len(loader.tgt.vocab)
     model = get_model(input_size, output_size, config)
-    crit = get_crit(output_size, data_loader.PAD)
+    crit = get_crit(output_size, data_loader.PAD) # -> PAD에는 weight를 주지 않기 위해 data_loader.PAD를 넘겨줌
 
     if model_weight is not None:
         model.load_state_dict(model_weight)
@@ -316,6 +325,7 @@ def main(config, model_weight=None, opt_weight=None):
 
     optimizer = get_optimizer(model, config)
 
+    # adam이나 radam인 경우, 로딩
     if opt_weight is not None and (config.use_adam or config.use_radam):
         optimizer.load_state_dict(opt_weight)
 

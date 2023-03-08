@@ -259,7 +259,7 @@ def get_crit(output_size, pad_index):
 
 def get_optimizer(model, config):
     if config.use_adam:
-        # use_adam이면서 use_transformer인 경우, Adam을 사용하는데 beats를 0.9와 0.98로 줌
+        # use_adam이면서 use_transformer인 경우, Adam을 사용하는데 betas를 0.9와 0.98로 줌
         if config.use_transformer:
             optimizer = optim.Adam(model.parameters(), lr=config.lr, betas=(.9, .98)) 
                 # betas=(.9, .98) : Pre-LM Transformer 논문에 나온 수치 
